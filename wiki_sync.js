@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// BookStack to Wiki.js Sync - Production Version
+// BookStack to Wiki.js Sync - Production Ready
 
 const axios = require('axios');
 const FormData = require('form-data');
@@ -9,58 +9,36 @@ const path = require('path');
 
 const CONFIG_PATH = './config.json';
 const STATE_PATH = './sync-state.json';
+const ASSETS_DIR = './sync-assets';
 
 class Sync {
   constructor(config) {
-    // Support both old and new config structures
-    this.bookstack = config.bookstack || config;
-    this.wikijs = config.wikijs || {};
+    this.config = config;
     this.dryRun = config.dryRun || false;
-    this.verbose = config.verbose || false;
     
     this.bookstackClient = axios.create({
-      baseURL: `${this.bookstack.url}/api`,
+      baseURL: `${config.bookstack.url}/api`,
       headers: {
-        'Authorization': `Token ${this.bookstack.tokenId}:${this.bookstack.tokenSecret}`
-      },
-      timeout: 30000
+        'Authorization': `Token ${config.bookstack.tokenId}:${config.bookstack.tokenSecret}`
+      }
     });
     
     this.wikijsClient = axios.create({
-      baseURL: `${this.wikijs.url}/graphql`,
+      baseURL: `${config.wikijs.url}/graphql`,
       headers: {
-        'Authorization': `Bearer ${this.wikijs.apiKey}`
-      },
-      timeout: 30000
+        'Authorization': `Bearer ${config.wikijs.apiKey}`
+      }
     });
     
     this.state = { assets: {}, pages: {} };
     this.stats = { pages: 0, assets: 0, errors: 0 };
   }
 
-  log(message, force = false) {
-    if (this.verbose || force) {
-      console.log(message);
-    }
-  }
-
-  async loadState() {
-    try {
-      this.state = JSON.parse(await fs.readFile(STATE_PATH, 'utf8'));
-    } catch {
-      this.state = { assets: {}, pages: {} };
-    }
-  }
-
-  async saveState() {
-    await fs.writeFile(STATE_PATH, JSON.stringify(this.state, null, 2));
-  }
-
   async run() {
     await this.loadState();
     await fs.mkdir(ASSETS_DIR, { recursive: true });
     
-    this.log('=== Starting Sync ===', true);
+    console.log('=== Sync Started ===');
     
     const userId = await this.getUserId();
     const shelves = await this.fetchAll('/shelves');
@@ -68,11 +46,10 @@ class Sync {
     const chapters = await this.fetchAll('/chapters');
     const pages = await this.fetchAll('/pages');
     
-    this.log(`Found: ${shelves.length} shelves, ${books.length} books, ${chapters.length} chapters, ${pages.length} pages`, true);
+    console.log(`Loaded: ${shelves.length} shelves, ${books.length} books, ${chapters.length} chapters, ${pages.length} pages`);
     
     // Build shelf mapping
-    const bookToShelf = await this.buildShelfMapping(shelves);
-    this.log(`[DEBUG] ${bookToShelf.size} books mapped to shelves`, this.verbose);
+    const shelfMap = await this.buildShelfMapping(shelves);
     
     // Process pages
     for (let i = 0; i < pages.length; i++) {
@@ -80,39 +57,30 @@ class Sync {
       try {
         const detail = await this.bookstackClient.get(`/pages/${page.id}`).then(r => r.data);
         
-        // Build full path with correct hierarchy
+        // Build path with shelf
         const book = books.find(b => b.id === page.book_id);
-        const shelf = bookToShelf.get(page.book_id);
+        const shelf = shelfMap.get(page.book_id);
         const chapter = chapters.find(c => c.id === page.chapter_id);
         
         const pathParts = [];
-        if (shelf?.slug) {
-          pathParts.push(shelf.slug);
-          this.log(`[DEBUG] Added shelf slug: ${shelf.slug}`, this.verbose);
-        }
-        if (book?.slug) {
-          pathParts.push(book.slug);
-          this.log(`[DEBUG] Added book slug: ${book.slug}`, this.verbose);
-        }
-        if (chapter?.slug) {
-          pathParts.push(chapter.slug);
-          this.log(`[DEBUG] Added chapter slug: ${chapter.slug}`, this.verbose);
-        }
+        if (shelf?.slug) pathParts.push(shelf.slug);
+        if (book?.slug) pathParts.push(book.slug);
+        if (chapter?.slug) pathParts.push(chapter.slug);
         pathParts.push(page.slug);
         
         const pagePath = pathParts.join('/').toLowerCase().replace(/[^a-z0-9\/\-_]/g, '-');
-        this.log(`[DEBUG] Final path: ${pagePath}`, this.verbose);
         
-        // Process content
+        console.log(`[${i + 1}/${pages.length}] ${pagePath}`);
+        
+        // Process assets
         const content = await this.processContent(detail.markdown || detail.html || '', pagePath);
         
-        // Sync
+        // Sync page
         if (!this.dryRun) {
           await this.syncPage(pagePath, page.name, content, userId, !page.draft);
         }
         
         this.stats.pages++;
-        console.log(`${this.dryRun ? '[DRY] ' : ''}[PAGE] ${pagePath}`);
         
       } catch (error) {
         this.stats.errors++;
@@ -121,7 +89,7 @@ class Sync {
     }
     
     await this.saveState();
-    this.log('\n=== Sync Complete ===', true);
+    console.log('\n=== Sync Complete ===');
     console.log(`Pages: ${this.stats.pages}, Assets: ${this.stats.assets}, Errors: ${this.stats.errors}`);
   }
 
@@ -144,28 +112,25 @@ class Sync {
         query: '{ users { list { id email } } }' 
       });
       const users = data.data?.users?.list || [];
-      const defaultUser = users.find(u => u.email === this.wikijs.defaultUserEmail);
-      return defaultUser?.id || users[0]?.id || 1;
+      return users[0]?.id || 1;
     } catch {
       return 1;
     }
   }
 
   async buildShelfMapping(shelves) {
-    const mapping = new Map();
+    const map = new Map();
     for (const shelf of shelves) {
       try {
-        this.log(`[DEBUG] Querying shelf ${shelf.id} (${shelf.name}) for books...`, this.verbose);
         const shelfBooks = await this.fetchAll(`/shelves/${shelf.id}/books`);
-        this.log(`[DEBUG] Shelf ${shelf.id} has ${shelfBooks.length} books`, this.verbose);
         for (const book of shelfBooks) {
-          mapping.set(book.id, shelf);
+          map.set(book.id, shelf);
         }
       } catch (error) {
-        this.log(`[WARN] Shelf ${shelf.id}: ${error.message}`, this.verbose);
+        console.warn(`Shelf ${shelf.id}: ${error.message}`);
       }
     }
-    return mapping;
+    return map;
   }
 
   async processContent(content, pagePath) {
@@ -178,7 +143,7 @@ class Sync {
       
       if (!this.state.assets[key]) {
         try {
-          const imageUrl = `${this.bookstack.url}/uploads/images/gallery/2024-01/${filename}`;
+          const imageUrl = `${this.config.bookstack.url}/uploads/images/gallery/2024-01/${filename}`;
           const response = await axios.get(imageUrl, { responseType: 'stream' });
           const filePath = path.join(ASSETS_DIR, filename);
           response.data.pipe(createWriteStream(filePath));
@@ -191,7 +156,7 @@ class Sync {
           
           content = content.replace(match[0], `![${alt}](${uploadedPath})`);
         } catch (e) {
-          this.log(`[WARN] Image ${filename}: ${e.message}`);
+          console.warn(`Image failed: ${filename}`);
         }
       } else {
         content = content.replace(match[0], `![${alt}](${this.state.assets[key]})`);
@@ -220,7 +185,7 @@ class Sync {
           
           content = content.replace(match[0], `[${name}](${uploadedPath})`);
         } catch (e) {
-          this.log(`[WARN] Attachment ${id}: ${e.message}`);
+          console.warn(`Attachment failed: ${id}`);
         }
       } else {
         content = content.replace(match[0], `[${name}](${this.state.assets[key]})`);
@@ -235,16 +200,16 @@ class Sync {
     const form = new FormData();
     form.append('media', buffer, { filename });
     
-    const { data } = await axios.post(`${this.wikijs.url}/u`, form, {
-      headers: { ...form.getHeaders(), Authorization: `Bearer ${this.wikijs.apiKey}` }
+    const { data } = await axios.post(`${this.config.wikijs.url}/u`, form, {
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${this.config.wikijs.apiKey}` }
     });
     
     return data;
   }
 
   async syncPage(path, title, content, userId, published) {
-    const checkQuery = `{ pages { single(by: { path: "${path}" }) { id } } }`;
-    const { data } = await this.wikijsClient.post('', { query: checkQuery });
+    const query = `{ pages { single(by: { path: "${path}" }) { id } } }`;
+    const { data } = await this.wikijsClient.post('', { query });
     
     const pageData = { path, title, description: content, editor: 'markdown', isPublished: published, authorId: userId, creatorId: userId };
 
@@ -265,21 +230,21 @@ async function main() {
   if (args.includes('--init')) {
     const config = {
       bookstack: { url: 'http://localhost:6875', tokenId: '', tokenSecret: '' },
-      wikijs: { url: 'http://localhost:3000', apiKey: '', defaultUserEmail: 'admin@example.com' }
+      wikijs: { url: 'http://localhost:3000', apiKey: '', defaultUserEmail: 'admin@example.com' },
+      dryRun: false
     };
     await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2));
-    console.log('[CONFIG] Created config.json. Edit with your credentials.');
+    console.log('Created config.json - edit with your credentials');
     return;
   }
 
   if (!(await fs.access(CONFIG_PATH).then(() => true).catch(() => false))) {
-    console.error('[ERROR] config.json not found. Run: node wiki_sync.js --init');
+    console.error('ERROR: config.json not found. Run: node wiki_sync.js --init');
     process.exit(1);
   }
 
   const config = JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8'));
   config.dryRun = args.includes('--dry-run');
-  config.verbose = args.includes('--verbose');
   
   const sync = new Sync(config);
   await sync.run();
