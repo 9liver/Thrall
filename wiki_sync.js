@@ -1,10 +1,6 @@
 #!/usr/bin/env node
 
-/**
- * BookStack to Wiki.js Sync Script
- * Production-ready with correct hierarchy and quiet operation
- * Usage: node wiki_sync.js [--dry-run] [--verbose]
- */
+// BookStack to Wiki.js Sync - Production Version
 
 const axios = require('axios');
 const FormData = require('form-data');
@@ -16,8 +12,9 @@ const STATE_PATH = './sync-state.json';
 
 class Sync {
   constructor(config) {
-    this.bookstack = config.bookstack;
-    this.wikijs = config.wikijs;
+    // Support both old and new config structures
+    this.bookstack = config.bookstack || config;
+    this.wikijs = config.wikijs || {};
     this.dryRun = config.dryRun || false;
     this.verbose = config.verbose || false;
     
@@ -25,14 +22,16 @@ class Sync {
       baseURL: `${this.bookstack.url}/api`,
       headers: {
         'Authorization': `Token ${this.bookstack.tokenId}:${this.bookstack.tokenSecret}`
-      }
+      },
+      timeout: 30000
     });
     
     this.wikijsClient = axios.create({
       baseURL: `${this.wikijs.url}/graphql`,
       headers: {
         'Authorization': `Bearer ${this.wikijs.apiKey}`
-      }
+      },
+      timeout: 30000
     });
     
     this.state = { assets: {}, pages: {} };
@@ -59,45 +58,53 @@ class Sync {
 
   async run() {
     await this.loadState();
-    await fs.mkdir(this.assetsDir, { recursive: true });
+    await fs.mkdir(ASSETS_DIR, { recursive: true });
     
     this.log('=== Starting Sync ===', true);
     
-    // Get user ID
     const userId = await this.getUserId();
-    
-    // Fetch all data
     const shelves = await this.fetchAll('/shelves');
     const books = await this.fetchAll('/books');
     const chapters = await this.fetchAll('/chapters');
     const pages = await this.fetchAll('/pages');
     
-    this.log(`Hierarchy: ${shelves.length} shelves, ${books.length} books, ${chapters.length} chapters, ${pages.length} pages`, true);
+    this.log(`Found: ${shelves.length} shelves, ${books.length} books, ${chapters.length} chapters, ${pages.length} pages`, true);
     
     // Build shelf mapping
     const bookToShelf = await this.buildShelfMapping(shelves);
+    this.log(`[DEBUG] ${bookToShelf.size} books mapped to shelves`, this.verbose);
     
     // Process pages
-    for (const page of pages) {
+    for (let i = 0; i < pages.length; i++) {
+      const page = pages[i];
       try {
-        // Get full page details
         const detail = await this.bookstackClient.get(`/pages/${page.id}`).then(r => r.data);
         
-        // Build path
+        // Build full path with correct hierarchy
         const book = books.find(b => b.id === page.book_id);
         const shelf = bookToShelf.get(page.book_id);
         const chapter = chapters.find(c => c.id === page.chapter_id);
         
         const pathParts = [];
-        if (shelf && shelf.slug) pathParts.push(shelf.slug);
-        if (book && book.slug) pathParts.push(book.slug);
-        if (chapter && chapter.slug) pathParts.push(chapter.slug);
+        if (shelf?.slug) {
+          pathParts.push(shelf.slug);
+          this.log(`[DEBUG] Added shelf slug: ${shelf.slug}`, this.verbose);
+        }
+        if (book?.slug) {
+          pathParts.push(book.slug);
+          this.log(`[DEBUG] Added book slug: ${book.slug}`, this.verbose);
+        }
+        if (chapter?.slug) {
+          pathParts.push(chapter.slug);
+          this.log(`[DEBUG] Added chapter slug: ${chapter.slug}`, this.verbose);
+        }
         pathParts.push(page.slug);
         
         const pagePath = pathParts.join('/').toLowerCase().replace(/[^a-z0-9\/\-_]/g, '-');
+        this.log(`[DEBUG] Final path: ${pagePath}`, this.verbose);
         
-        // Process content and assets
-        const content = await this.processContent(detail.markdown || detail.html || '', detail.html || '');
+        // Process content
+        const content = await this.processContent(detail.markdown || detail.html || '', pagePath);
         
         // Sync
         if (!this.dryRun) {
@@ -105,7 +112,7 @@ class Sync {
         }
         
         this.stats.pages++;
-        this.log(`[PAGE] ${this.dryRun ? '[DRY] ' : ''}${pagePath}`);
+        console.log(`${this.dryRun ? '[DRY] ' : ''}[PAGE] ${pagePath}`);
         
       } catch (error) {
         this.stats.errors++;
@@ -133,7 +140,9 @@ class Sync {
 
   async getUserId() {
     try {
-      const { data } = await this.wikijsClient.post('', { query: '{ users { list { id email } } }' });
+      const { data } = await this.wikijsClient.post('', { 
+        query: '{ users { list { id email } } }' 
+      });
       const users = data.data?.users?.list || [];
       const defaultUser = users.find(u => u.email === this.wikijs.defaultUserEmail);
       return defaultUser?.id || users[0]?.id || 1;
@@ -146,72 +155,75 @@ class Sync {
     const mapping = new Map();
     for (const shelf of shelves) {
       try {
+        this.log(`[DEBUG] Querying shelf ${shelf.id} (${shelf.name}) for books...`, this.verbose);
         const shelfBooks = await this.fetchAll(`/shelves/${shelf.id}/books`);
+        this.log(`[DEBUG] Shelf ${shelf.id} has ${shelfBooks.length} books`, this.verbose);
         for (const book of shelfBooks) {
           mapping.set(book.id, shelf);
         }
       } catch (error) {
-        this.log(`[WARN] Failed to fetch books for shelf ${shelf.id}: ${error.message}`);
+        this.log(`[WARN] Shelf ${shelf.id}: ${error.message}`, this.verbose);
       }
     }
     return mapping;
   }
 
-  async processContent(markdown, html) {
-    let content = markdown || html || '';
-    
+  async processContent(content, pagePath) {
     // Process images
-    content = content.replace(/!\[([^\]]*)\]\(\/uploads\/images\/gallery\/[^\/]+\/([^)]+)\)/g, async (match, alt, filename) => {
-      const imageKey = `img_${filename}`;
-      if (!this.state.assets[imageKey]) {
+    const imageRegex = /!\[([^\]]*)\]\(\/uploads\/images\/gallery\/[^\/]+\/([^)]+)\)/g;
+    const imageMatches = [...content.matchAll(imageRegex)];
+    for (const match of imageMatches) {
+      const [, alt, filename] = match;
+      const key = `img_${filename}`;
+      
+      if (!this.state.assets[key]) {
         try {
-          const url = `${this.bookstack.url}/uploads/images/gallery/2024-01/${filename}`;
-          const response = await axios.get(url, { responseType: 'stream' });
-          const filePath = `${this.assetsDir}/${filename}`;
+          const imageUrl = `${this.bookstack.url}/uploads/images/gallery/2024-01/${filename}`;
+          const response = await axios.get(imageUrl, { responseType: 'stream' });
+          const filePath = path.join(ASSETS_DIR, filename);
           response.data.pipe(createWriteStream(filePath));
           await new Promise((resolve, reject) => response.data.on('end', resolve).on('error', reject));
           
           const uploadedPath = await this.uploadAsset(filePath, filename);
-          this.state.assets[imageKey] = uploadedPath;
+          this.state.assets[key] = uploadedPath;
           this.stats.assets++;
           await fs.unlink(filePath);
           
-          return `![${alt}](${uploadedPath})`;
+          content = content.replace(match[0], `![${alt}](${uploadedPath})`);
         } catch (e) {
           this.log(`[WARN] Image ${filename}: ${e.message}`);
-          return match;
         }
+      } else {
+        content = content.replace(match[0], `![${alt}](${this.state.assets[key]})`);
       }
-      return `![${alt}](${this.state.assets[imageKey]})`;
-    });
+    }
 
-    // Process attachments asynchronously
-    const attachmentMatches = content.match(/\[([^\]]+)\]\(\/attachments\/(\d+)\)/g);
-    if (attachmentMatches) {
-      for (const match of attachmentMatches) {
-        const [, name, id] = match.match(/\[([^\]]+)\]\(\/attachments\/(\d+)\)/);
-        const key = `att_${id}`;
-        
-        if (!this.state.assets[key]) {
-          try {
-            const response = await this.bookstackClient.get(`/attachments/${id}`, { responseType: 'stream' });
-            const filename = response.headers['content-disposition']?.split('filename=')[1]?.replace(/"/g, '') || `attachment-${id}`;
-            const filePath = `${this.assetsDir}/${filename}`;
-            response.data.pipe(createWriteStream(filePath));
-            await new Promise((resolve, reject) => response.data.on('end', resolve).on('error', reject));
-            
-            const uploadedPath = await this.uploadAsset(filePath, filename);
-            this.state.assets[key] = uploadedPath;
-            this.stats.assets++;
-            await fs.unlink(filePath);
-            
-            content = content.replace(match, `[${name}](${uploadedPath})`);
-          } catch (e) {
-            this.log(`[WARN] Attachment ${id}: ${e.message}`);
-          }
-        } else {
-          content = content.replace(match, `[${name}](${this.state.assets[key]})`);
+    // Process attachments
+    const attachmentRegex = /\[([^\]]+)\]\(\/attachments\/(\d+)\)/g;
+    const attachmentMatches = [...content.matchAll(attachmentRegex)];
+    for (const match of attachmentMatches) {
+      const [, name, id] = match;
+      const key = `att_${id}`;
+      
+      if (!this.state.assets[key]) {
+        try {
+          const response = await this.bookstackClient.get(`/attachments/${id}`, { responseType: 'stream' });
+          const filename = response.headers['content-disposition']?.split('filename=')[1]?.replace(/"/g, '') || `attachment-${id}`;
+          const filePath = path.join(ASSETS_DIR, filename);
+          response.data.pipe(createWriteStream(filePath));
+          await new Promise((resolve, reject) => response.data.on('end', resolve).on('error', reject));
+          
+          const uploadedPath = await this.uploadAsset(filePath, filename);
+          this.state.assets[key] = uploadedPath;
+          this.stats.assets++;
+          await fs.unlink(filePath);
+          
+          content = content.replace(match[0], `[${name}](${uploadedPath})`);
+        } catch (e) {
+          this.log(`[WARN] Attachment ${id}: ${e.message}`);
         }
+      } else {
+        content = content.replace(match[0], `[${name}](${this.state.assets[key]})`);
       }
     }
 
@@ -231,31 +243,17 @@ class Sync {
   }
 
   async syncPage(path, title, content, userId, published) {
-    const query = `{ pages { single(by: { path: "${path}" }) { id } } }`;
-    const { data } = await this.wikijsClient.post('', { query });
+    const checkQuery = `{ pages { single(by: { path: "${path}" }) { id } } }`;
+    const { data } = await this.wikijsClient.post('', { query: checkQuery });
     
-    const pageData = {
-      path,
-      title,
-      description: content,
-      editor: 'markdown',
-      isPublished: published,
-      authorId: userId,
-      creatorId: userId
-    };
+    const pageData = { path, title, description: content, editor: 'markdown', isPublished: published, authorId: userId, creatorId: userId };
 
     if (data.data?.pages?.single) {
       const mutation = `mutation($id: Int!, $c: PageInput!) { pages { update(id: $id, content: $c) { responseResult { succeeded } } } }`;
-      await this.wikijsClient.post('', {
-        query: mutation,
-        variables: { id: data.data.pages.single.id, c: pageData }
-      });
+      await this.wikijsClient.post('', { query: mutation, variables: { id: data.data.pages.single.id, c: pageData } });
     } else {
       const mutation = 'mutation($c: PageInput!) { pages { create(content: $c) { responseResult { succeeded } } } }';
-      await this.wikijsClient.post('', {
-        query: mutation,
-        variables: { c: pageData }
-      });
+      await this.wikijsClient.post('', { query: mutation, variables: { c: pageData } });
     }
   }
 }
@@ -267,14 +265,16 @@ async function main() {
   if (args.includes('--init')) {
     const config = {
       bookstack: { url: 'http://localhost:6875', tokenId: '', tokenSecret: '' },
-      wikijs: { url: 'http://localhost:3000', apiKey: '', defaultUserEmail: 'admin@example.com' },
-      assetsDir: './sync-assets',
-      dryRun: args.includes('--dry-run'),
-      verbose: args.includes('--verbose')
+      wikijs: { url: 'http://localhost:3000', apiKey: '', defaultUserEmail: 'admin@example.com' }
     };
     await fs.writeFile(CONFIG_PATH, JSON.stringify(config, null, 2));
-    console.log('Created config.json');
+    console.log('[CONFIG] Created config.json. Edit with your credentials.');
     return;
+  }
+
+  if (!(await fs.access(CONFIG_PATH).then(() => true).catch(() => false))) {
+    console.error('[ERROR] config.json not found. Run: node wiki_sync.js --init');
+    process.exit(1);
   }
 
   const config = JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8'));
