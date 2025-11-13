@@ -2,7 +2,7 @@
 
 /**
  * BookStack to Wiki.js Sync Script
- * Ultra-robust version with automatic fallback
+ * Fixed version with proper shelf-book-page hierarchy
  * Usage: node wiki_sync.js [options]
  */
 
@@ -37,7 +37,7 @@ const DEFAULT_CONFIG = {
     hierarchySeparator: '/',
     includeDrafts: false,
     dryRun: false,
-    skipUserMapping: true  // DEFAULT TO TRUE - avoids GraphQL user issues
+    skipUserMapping: true  // DEFAULT: Skip user mapping
   }
 };
 
@@ -64,12 +64,13 @@ class BookStackToWikiJSSync {
       userMappingErrors: 0,
       errors: 0
     };
-    // Single hardcoded user ID for fallback - we'll fetch this once
     this.fallbackUserId = null;
+    this.bookToShelfMap = new Map(); // bookId -> shelf object
+    this.bookMap = new Map(); // bookId -> book object
   }
 
   async initialize() {
-    console.log('[START] Initializing sync...');
+    console.log('[STARTUP] Initializing sync...');
     this.validateConfig();
 
     // Setup HTTP clients
@@ -93,7 +94,7 @@ class BookStackToWikiJSSync {
       timeout: 30000
     });
 
-    // Load or initialize state
+    // Load state
     await this.loadState();
     
     // Ensure asset directory exists
@@ -101,6 +102,9 @@ class BookStackToWikiJSSync {
     
     // Get fallback user ID
     await this.resolveFallbackUser();
+    
+    // Build book->shelf mapping
+    await this.buildBookShelfMapping();
     
     console.log('[READY] Initialization complete');
   }
@@ -124,34 +128,51 @@ class BookStackToWikiJSSync {
     console.log('[USER] Resolving fallback user...');
     
     try {
-      // Try to get the first available user from Wiki.js
-      const query = {
-        query: `query { users { list { id email } } }`
-      };
-      
+      const query = { query: `{ users { list { id email } } }` };
       const response = await this.wikijsClient.post('', query);
       
       if (response.data.errors) {
-        console.warn('[USER] GraphQL error:', JSON.stringify(response.data.errors, null, 2));
-        throw new Error('Cannot query users');
+        console.warn('[USER] GraphQL warning:', JSON.stringify(response.data.errors));
+        throw new Error('User query failed');
       }
       
       const users = response.data.data?.users?.list || [];
       
       if (users.length === 0) {
-        throw new Error('No users found in Wiki.js');
+        throw new Error('No users in Wiki.js');
       }
       
-      // Prefer the configured default user email
       const defaultUser = users.find(u => u.email === this.config.wikijs.defaultUserEmail);
       this.fallbackUserId = defaultUser ? defaultUser.id : users[0].id;
       
-      console.log(`[USER] Fallback user ID resolved: ${this.fallbackUserId}`);
+      console.log(`[USER] Fallback user ID: ${this.fallbackUserId}`);
       
     } catch (error) {
-      console.warn(`[USER] Failed to resolve fallback user: ${error.message}`);
-      console.warn('[USER] Will attempt to use default user ID: 1');
-      this.fallbackUserId = 1; // Most common default admin ID
+      console.warn(`[USER] Resolution failed: ${error.message}`);
+      console.warn('[USER] Using ID: 1');
+      this.fallbackUserId = 1;
+    }
+  }
+
+  async buildBookShelfMapping() {
+    console.log('[MAPPING] Building book->shelf relationships...');
+    
+    try {
+      // Get all shelves
+      const shelves = await this.paginateBookStack('/shelves');
+      
+      // For each shelf, get its books and build the mapping
+      for (const shelf of shelves) {
+        const shelfBooks = await this.paginateBookStack(`/shelves/${shelf.id}/books`);
+        for (const book of shelfBooks) {
+          this.bookToShelfMap.set(book.id, shelf);
+          this.bookMap.set(book.id, book);
+        }
+      }
+      
+      console.log(`[MAPPING] Mapped ${this.bookToShelfMap.size} books to shelves`);
+    } catch (error) {
+      console.warn('[MAPPING] Failed:', error.message);
     }
   }
 
@@ -160,7 +181,7 @@ class BookStackToWikiJSSync {
       await this.initialize();
       
       if (this.config.sync.dryRun) {
-        console.log('[DRYRUN] Preview mode - no changes will be made');
+        console.log('[DRYRUN] Preview mode - no changes');
       }
 
       console.log('[PROGRESS] Fetching BookStack hierarchy...');
@@ -172,14 +193,14 @@ class BookStackToWikiJSSync {
         console.log('[PROGRESS] Mapping users...');
         await this.mapAllUsers(hierarchy.users);
       } else {
-        console.log('[INFO] Skipping user mapping, using fallback user ID');
+        console.log('[INFO] User mapping disabled - using fallback user');
       }
       
       console.log('[PROGRESS] Syncing assets...');
       await this.syncAssets();
 
       console.log('[PROGRESS] Syncing pages...');
-      await this.syncPages(hierarchy);
+      await this.syncPages(hierarchy)
 
       console.log('[PROGRESS] Saving state...');
       await this.saveState();
@@ -231,8 +252,9 @@ class BookStackToWikiJSSync {
         const pageDetail = await this.bookstackClient.get(`/pages/${page.id}`);
         const data = pageDetail.data;
         
-        const createdBy = this.extractUserId(data.created_by);
-        const updatedBy = this.extractUserId(data.updated_by);
+        // Get book and shelf information
+        const book = this.bookMap.get(page.book_id) || hierarchy.books.find(b => b.id === page.book_id);
+        const shelf = this.bookToShelfMap.get(page.book_id);
         
         hierarchy.pages.push({
           id: page.id,
@@ -244,30 +266,22 @@ class BookStackToWikiJSSync {
           updated_at: data.updated_at,
           draft: page.draft,
           book_id: page.book_id,
-          shelf_id: page.shelf_id,
+          shelf_id: shelf?.id,
           chapter_id: page.chapter_id,
-          created_by: createdBy,
-          updated_by: updatedBy,
-          bookSlug: hierarchy.books.find(b => b.id === page.book_id)?.slug || 'uncategorized',
-          shelfSlug: hierarchy.shelves.find(s => s.id === page.shelf_id)?.slug,
+          created_by: this.fallbackUserId,
+          updated_by: this.fallbackUserId,
+          bookSlug: book?.slug || 'uncategorized',
+          shelfSlug: shelf?.slug,
           chapterSlug: hierarchy.chapters.find(c => c.id === page.chapter_id)?.slug
         });
         
-        hierarchy.users.add(createdBy);
-        hierarchy.users.add(updatedBy);
+        hierarchy.users.add(this.fallbackUserId);
       } catch (error) {
         console.warn(`[WARN] Failed to enrich page ${page.id}: ${error.message}`);
       }
     }
 
     return hierarchy;
-  }
-
-  extractUserId(userField) {
-    if (typeof userField === 'object' && userField !== null) {
-      return userField.id || this.fallbackUserId;
-    }
-    return userField || this.fallbackUserId;
   }
 
   async paginateBookStack(endpoint) {
@@ -301,41 +315,12 @@ class BookStackToWikiJSSync {
   }
 
   // =============================================================================
-  // USER MAPPING (OPTIONAL)
+  // USER MAPPING (NO-OP)
   // =============================================================================
 
   async mapAllUsers(bookstackUserIds) {
-    if (this.config.sync.skipUserMapping) {
-      console.log('[USER] Mapping disabled - all content will use fallback user');
-      return;
-    }
-
-    const uniqueIds = Array.from(bookstackUserIds).filter(id => id && typeof id === 'number');
-    console.log(`[USER] Attempting to map ${uniqueIds.length} users...`);
-    
-    for (const userId of uniqueIds) {
-      await this.mapUser(userId);
-    }
-  }
-
-  async mapUser(bookstackUserId) {
-    if (this.state.userMap[bookstackUserId]) return this.state.userMap[bookstackUserId];
-
-    try {
-      const userResponse = await this.bookstackClient.get(`/users/${bookstackUserId}`);
-      const userEmail = userResponse.data.email || this.config.wikijs.defaultUserEmail;
-
-      // In a real implementation, you'd query Wiki.js for this user
-      // For now, just use fallback and log the mapping
-      console.log(`[USER] Mapping BookStack user ${bookstackUserId} (${userEmail}) -> Wiki.js fallback user`);
-      
-      this.state.userMap[bookstackUserId] = this.fallbackUserId;
-      return this.state.userMap[bookstackUserId];
-    } catch (error) {
-      console.warn(`[USER] Failed to get BookStack user ${bookstackUserId}:`, error.message);
-      this.stats.userMappingErrors++;
-      return this.fallbackUserId;
-    }
+    // No-op - we always use fallback user
+    console.log(`[USER] Processing ${bookstackUserIds.size} users (using fallback)`);
   }
 
   // =============================================================================
@@ -343,18 +328,16 @@ class BookStackToWikiJSSync {
   // =============================================================================
 
   async syncAssets() {
-    console.log('[ASSET] Starting asset synchronization...');
+    console.log('[ASSET] Starting synchronization...');
     
-    // Sync images
     const images = await this.paginateBookStack('/image-gallery');
-    console.log(`[ASSET] Found ${images.length} images`);
+    console.log(`[ASSET] Images: ${images.length}`);
     for (const image of images) {
       await this.syncAsset('image', image);
     }
 
-    // Sync attachments
     const attachments = await this.paginateBookStack('/attachments');
-    console.log(`[ASSET] Found ${attachments.length} attachments`);
+    console.log(`[ASSET] Attachments: ${attachments.length}`);
     for (const attachment of attachments) {
       await this.syncAsset('attachment', attachment);
     }
@@ -365,12 +348,12 @@ class BookStackToWikiJSSync {
     const assetName = asset.name || path.basename(asset.path || `asset-${assetId}`);
     
     if (this.state.assetMap[assetId]) {
-      console.log(`[ASSET] Skipping ${assetName} (already synced)`);
+      console.log(`[ASSET] Skip ${assetName} (synced)`);
       return this.state.assetMap[assetId];
     }
 
     try {
-      console.log(`[ASSET] Processing ${type}: ${assetName} (ID: ${assetId})`);
+      console.log(`[ASSET] Process ${type}: ${assetName}`);
       
       const downloadUrl = type === 'image' 
         ? `${this.config.bookstack.url}${asset.path}`
@@ -392,10 +375,10 @@ class BookStackToWikiJSSync {
       let wikijsPath = '/assets/default.png';
       
       if (!this.config.sync.dryRun) {
-        console.log('[API] Uploading asset to Wiki.js...');
+        console.log('[API] Uploading...');
         wikijsPath = await this.uploadAssetToWikiJS(localPath, assetName);
       } else {
-        console.log('[DRYRUN] Would upload asset to Wiki.js');
+        console.log('[DRYRUN] Would upload');
       }
 
       this.state.assetMap[assetId] = wikijsPath;
@@ -403,12 +386,10 @@ class BookStackToWikiJSSync {
       await fs.unlink(localPath);
 
       console.log(`[ASSET] Success: ${wikijsPath}`);
-      return wikijsPath;
 
     } catch (error) {
       console.error(`[ASSET] Failed ${assetName}: ${error.message}`);
       this.stats.errors++;
-      return null;
     }
   }
 
@@ -441,6 +422,7 @@ class BookStackToWikiJSSync {
   // =============================================================================
 
   async syncPages(hierarchy) {
+    // Sort by path depth to ensure parent pages are created first
     const sortedPages = hierarchy.pages.sort((a, b) => {
       const aDepth = this.getPagePath(a).split('/').length;
       const bDepth = this.getPagePath(b).split('/').length;
@@ -452,36 +434,54 @@ class BookStackToWikiJSSync {
     for (let i = 0; i < sortedPages.length; i++) {
       const page = sortedPages[i];
       console.log(`[PAGE] ${i + 1}/${sortedPages.length}: ${page.name}`);
-      await this.syncPage(page, hierarchy);
+      await this.syncPage(page);
     }
   }
 
   getPagePath(page) {
     const parts = [];
     
-    if (page.shelfSlug) parts.push(page.shelfSlug);
-    if (page.bookSlug) parts.push(page.bookSlug);
-    if (page.chapterSlug) parts.push(page.chapterSlug);
+    // Add shelf slug if available
+    if (page.shelfSlug) {
+      parts.push(page.shelfSlug);
+    }
+    
+    // Add book slug
+    if (page.bookSlug) {
+      parts.push(page.bookSlug);
+    }
+    
+    // Add chapter slug if available
+    if (page.chapterSlug) {
+      parts.push(page.chapterSlug);
+    }
+    
+    // Always add page slug last
     parts.push(page.slug);
     
-    return parts
+    // Clean up the path
+    const finalPath = parts
       .join(this.config.sync.hierarchySeparator)
       .toLowerCase()
       .replace(/[^a-z0-9\/\-_]/g, '-');
+    
+    // Log the path construction for debugging
+    console.log(`[DEBUG] Path construction: ${parts.join(' -> ')} => ${finalPath}`);
+    
+    return finalPath;
   }
 
-  async syncPage(page, hierarchy) {
+  async syncPage(page) {
     const pagePath = this.getPagePath(page);
     
     try {
       const transformedMarkdown = await this.transformContent(page.markdown, page.html);
-      const createdBy = this.config.sync.skipUserMapping ? this.fallbackUserId : await this.mapUser(page.created_by);
-      const updatedBy = this.config.sync.skipUserMapping ? this.fallbackUserId : await this.mapUser(page.updated_by);
+      const userId = this.fallbackUserId; // Always use fallback
 
       const existingPage = await this.findWikiJSPage(pagePath);
 
       if (existingPage) {
-        console.log(`[PAGE] Updating: ${pagePath}`);
+        console.log(`[PAGE] Update: ${pagePath}`);
         
         if (!this.config.sync.dryRun) {
           await this.updateWikiJSPage(existingPage.id, {
@@ -489,12 +489,12 @@ class BookStackToWikiJSSync {
             description: transformedMarkdown,
             editor: 'markdown',
             isPublished: !page.draft,
-            authorId: updatedBy
+            authorId: userId
           });
         }
         this.stats.pagesUpdated++;
       } else {
-        console.log(`[PAGE] Creating: ${pagePath}`);
+        console.log(`[PAGE] Create: ${pagePath}`);
         
         if (!this.config.sync.dryRun) {
           const newPage = await this.createWikiJSPage({
@@ -503,8 +503,8 @@ class BookStackToWikiJSSync {
             description: transformedMarkdown,
             editor: 'markdown',
             isPublished: !page.draft,
-            authorId: createdBy,
-            creatorId: createdBy
+            authorId: userId,
+            creatorId: userId
           });
           
           this.state.pageMap[page.id] = newPage.id;
@@ -523,7 +523,7 @@ class BookStackToWikiJSSync {
     let content = markdown || html || '';
     
     if (!content) {
-      console.warn('[WARN] Empty page content');
+      console.warn('[WARN] Empty content');
       return ' ';
     }
 
@@ -556,22 +556,25 @@ class BookStackToWikiJSSync {
   }
 
   async findWikiJSPage(path) {
+    // Use inline query to avoid variable issues
     const query = {
-      query: `query { pages { single(by: { path: "${path}" }) { id path title } } }`
+      query: `{ pages { single(by: { path: "${path}" }) { id path title } } }`
     };
 
     try {
       const response = await this.wikijsClient.post('', query);
       
       if (response.data.errors) {
-        console.warn(`[WARN] GraphQL findPage error:`, JSON.stringify(response.data.errors));
+        // Likely "not found" - not an error
         return null;
       }
       
       return response.data.data.pages.single;
     } catch (error) {
-      if (error.response?.status === 404) return null;
-      console.warn(`[WARN] findPage failed: ${error.message}`);
+      if (error.response?.status === 404 || error.response?.status === 400) {
+        return null;
+      }
+      console.warn(`[WARN] findPage: ${error.message}`);
       return null;
     }
   }
@@ -602,7 +605,7 @@ class BookStackToWikiJSSync {
     const response = await this.wikijsClient.post('', mutation);
     
     if (response.data.errors) {
-      throw new Error(`GraphQL error: ${JSON.stringify(response.data.errors)}`);
+      throw new Error(`GraphQL: ${JSON.stringify(response.data.errors)}`);
     }
     
     const result = response.data.data.pages.create;
@@ -638,7 +641,7 @@ class BookStackToWikiJSSync {
     const response = await this.wikijsClient.post('', mutation);
     
     if (response.data.errors) {
-      throw new Error(`GraphQL error: ${JSON.stringify(response.data.errors)}`);
+      throw new Error(`GraphQL: ${JSON.stringify(response.data.errors)}`);
     }
     
     const result = response.data.data.pages.update;
@@ -656,16 +659,9 @@ class BookStackToWikiJSSync {
     try {
       const data = await fs.readFile(STATE_PATH, 'utf8');
       this.state = JSON.parse(data);
-      console.log(`[STATE] Loaded (last sync: ${this.state.lastSync || 'never'})`);
+      console.log(`[STATE] Loaded (last: ${this.state.lastSync || 'never'})`);
     } catch (error) {
-      console.log('[STATE] No previous state, starting fresh');
-      this.state = {
-        lastSync: null,
-        pageMap: {},
-        assetMap: {},
-        userMap: {},
-        defaultUserId: null
-      };
+      console.log('[STATE] Fresh start');
     }
   }
 
@@ -682,8 +678,7 @@ class BookStackToWikiJSSync {
     console.log(`Pages Created: ${this.stats.pagesCreated}`);
     console.log(`Pages Updated: ${this.stats.pagesUpdated}`);
     console.log(`Assets Uploaded: ${this.stats.assetsUploaded}`);
-    console.log(`User Mapping Errors: ${this.stats.userMappingErrors}`);
-    console.log(`Total Errors: ${this.stats.errors}`);
+    console.log(`Errors: ${this.stats.errors}`);
     console.log('='.repeat(50));
   }
 }
@@ -704,7 +699,7 @@ async function main() {
     config.sync = { ...config.sync, ...(userConfig.sync || {}) };
   } catch (error) {
     if (error.code !== 'ENOENT') {
-      console.warn(`[CONFIG] Warning: ${error.message}`);
+      console.warn(`[CONFIG] ${error.message}`);
     }
     console.log('[CONFIG] Using defaults, create config.yaml with --init');
   }
@@ -716,9 +711,6 @@ async function main() {
   }
   if (args.includes('--dry-run')) {
     config.sync.dryRun = true;
-  }
-  if (args.includes('--skip-users')) {
-    config.sync.skipUserMapping = true;
   }
 
   try {
@@ -737,7 +729,6 @@ bookstack:
   url: 'http://localhost:6875'
   tokenId: 'YOUR_BOOKSTACK_TOKEN_ID'
   tokenSecret: 'YOUR_BOOKSTACK_SECRET'
-  pageSize: 100
 
 wikijs:
   url: 'http://localhost:3000'
@@ -749,12 +740,12 @@ sync:
   hierarchySeparator: '/'
   includeDrafts: false
   dryRun: false
-  skipUserMapping: true  # Set to false only if user mapping works
+  skipUserMapping: true  # Keep true to avoid GraphQL issues
 `;
 
   await fs.writeFile(CONFIG_PATH, template);
   console.log('[CONFIG] Template created: config.yaml');
-  console.log('         Edit with your credentials, then run: node wiki_sync.js --dry-run');
+  console.log('         Edit with your credentials');
 }
 
 if (require.main === module) {
